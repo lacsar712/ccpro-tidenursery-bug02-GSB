@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: tidenursery
+      POSTGRES_PASSWORD: tidenursery
+      POSTGRES_DB: tidenursery
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tidenursery -d tidenursery"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  backend:
+    build: ./backend
+    ports:
+      - "8400:8400"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://tidenursery:tidenursery@db:5432/tidenursery
+      JWT_SECRET: tide-nursery-jwt-secret-change-me
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "480"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3400:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
