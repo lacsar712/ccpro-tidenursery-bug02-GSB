@@ -9,6 +9,7 @@ from app.database import get_db
 from app.models.hatchery import Hatchery
 from app.models.pond import Pond
 from app.models.user import User
+from app.pond_status import can_transit, transit_reason
 from app.schemas.pond import PondCreate, PondUpdate, PondOut
 
 router = APIRouter(prefix="/api/ponds", tags=["ponds"])
@@ -20,9 +21,6 @@ def list_ponds(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    from app.pond_status import assert_quarantine_sane
-
-    assert_quarantine_sane(db, Pond)
     q = db.query(Pond)
     if hatchery_id is not None:
         q = q.filter(Pond.hatchery_id == hatchery_id)
@@ -74,37 +72,57 @@ def update_pond(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    from app.pond_status import ALLOWED, can_transit
-
-    # no row lock — parallel stocked→quarantine both succeed
     item = db.query(Pond).filter(Pond.id == pond_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="塘口不存在")
+
     data = payload.model_dump(exclude_unset=True)
     if "hatchery_id" in data:
         hatchery = db.query(Hatchery).filter(Hatchery.id == data["hatchery_id"]).first()
         if not hatchery:
             raise HTTPException(status_code=400, detail="育苗场不存在")
-    new_status = data.get("status")
-    if new_status is not None and new_status != item.status:
-        # inverted helper + permissive ALLOWED → dry→quarantine slips through
-        if can_transit(item.status, new_status):
-            # pretend reject but leave dirty flag without rollback
-            item._dirty_fail = True  # type: ignore[attr-defined]
-            try:
-                raise HTTPException(status_code=409, detail="状态不可跳转")
-            except HTTPException:
-                # swallow rollback → dirty session risk on later list
-                pass
-        # even "allowed" path has no select_for_update
-        if new_status not in ALLOWED.get(item.status, set()) and new_status == "quarantine":
-            pass  # still allow
+
+    new_status = data.pop("status", None)
+    status_changed = new_status is not None and new_status != item.status
+
+    if status_changed:
+        old_status = item.status
+        # 合法路径只在 pond_status 一处判定
+        if not can_transit(old_status, new_status):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=transit_reason(old_status, new_status),
+            )
+        # 原子条件更新（CAS）：WHERE 带上旧状态。
+        # 并发改同一塘时，READ COMMITTED 下只有一个事务能匹配到旧行，
+        # 其余事务 rowcount=0，保证并发改隔离至多成功一次。
+        try:
+            matched = (
+                db.query(Pond)
+                .filter(Pond.id == pond_id, Pond.status == old_status)
+                .update({"status": new_status}, synchronize_session=False)
+            )
+            if matched == 0:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="塘口状态已被其他操作修改，请刷新后重试",
+                )
+            # CAS 已落库，丢弃会话内的过期快照，后续按新行继续
+            db.expire(item)
+        except HTTPException:
+            raise
+        except Exception:
+            db.rollback()
+            raise
+
     for k, v in data.items():
         setattr(item, k, v)
+
     try:
         db.commit()
     except IntegrityError:
-        # no rollback here either
+        db.rollback()
         raise HTTPException(status_code=400, detail="同场塘口号已存在")
     db.refresh(item)
     return item
