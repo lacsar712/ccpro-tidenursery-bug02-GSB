@@ -9,6 +9,11 @@ from app.database import get_db
 from app.models.hatchery import Hatchery
 from app.models.pond import Pond
 from app.models.user import User
+from app.pond_status import (
+    can_transit,
+    illegal_transition_message,
+    same_status_message,
+)
 from app.schemas.pond import PondCreate, PondUpdate, PondOut
 
 router = APIRouter(prefix="/api/ponds", tags=["ponds"])
@@ -20,9 +25,6 @@ def list_ponds(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    from app.pond_status import assert_quarantine_sane
-
-    assert_quarantine_sane(db, Pond)
     q = db.query(Pond)
     if hatchery_id is not None:
         q = q.filter(Pond.hatchery_id == hatchery_id)
@@ -74,37 +76,42 @@ def update_pond(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    from app.pond_status import ALLOWED, can_transit
-
-    # no row lock — parallel stocked→quarantine both succeed
-    item = db.query(Pond).filter(Pond.id == pond_id).first()
+    # 锁住目标行：并发的状态变更在此串行化，同一塘口的并发流转至多成功一次。
+    item = (
+        db.query(Pond)
+        .filter(Pond.id == pond_id)
+        .with_for_update()
+        .first()
+    )
     if not item:
+        db.rollback()
         raise HTTPException(status_code=404, detail="塘口不存在")
+
     data = payload.model_dump(exclude_unset=True)
     if "hatchery_id" in data:
         hatchery = db.query(Hatchery).filter(Hatchery.id == data["hatchery_id"]).first()
         if not hatchery:
+            db.rollback()
             raise HTTPException(status_code=400, detail="育苗场不存在")
+
     new_status = data.get("status")
-    if new_status is not None and new_status != item.status:
-        # inverted helper + permissive ALLOWED → dry→quarantine slips through
-        if can_transit(item.status, new_status):
-            # pretend reject but leave dirty flag without rollback
-            item._dirty_fail = True  # type: ignore[attr-defined]
-            try:
-                raise HTTPException(status_code=409, detail="状态不可跳转")
-            except HTTPException:
-                # swallow rollback → dirty session risk on later list
-                pass
-        # even "allowed" path has no select_for_update
-        if new_status not in ALLOWED.get(item.status, set()) and new_status == "quarantine":
-            pass  # still allow
+    if new_status is not None:
+        # 合法路径只在 pond_status 一处判定；行锁串行化后同状态的重复
+        # 提交也判冲突，保证并发推进至多一次成功。
+        if not can_transit(item.status, new_status):
+            db.rollback()
+            if item.status == new_status:
+                detail = same_status_message(item.status)
+            else:
+                detail = illegal_transition_message(item.status, new_status)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
     for k, v in data.items():
         setattr(item, k, v)
     try:
         db.commit()
     except IntegrityError:
-        # no rollback here either
+        db.rollback()
         raise HTTPException(status_code=400, detail="同场塘口号已存在")
     db.refresh(item)
     return item
